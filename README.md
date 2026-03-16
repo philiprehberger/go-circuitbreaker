@@ -92,6 +92,13 @@ The circuit breaker has three states:
 | `WithOnStateChange[T](fn)` | State transition callback |
 | `ErrCircuitOpen` | Error returned when the breaker is open |
 
+## Development
+
+```bash
+go test ./...
+go vet ./...
+```
+
 ## License
 
 MIT
