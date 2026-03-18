@@ -4,7 +4,7 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/philiprehberger/go-circuitbreaker.svg)](https://pkg.go.dev/github.com/philiprehberger/go-circuitbreaker)
 [![License](https://img.shields.io/github/license/philiprehberger/go-circuitbreaker)](LICENSE)
 
-Generic circuit breaker for Go. Protect external calls with automatic failure detection and recovery.
+Generic circuit breaker for Go. Protect external calls with automatic failure detection and recovery
 
 ## Installation
 
