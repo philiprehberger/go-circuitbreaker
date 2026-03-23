@@ -61,3 +61,20 @@ func (kb *KeyedBreaker[T]) ResetAll() {
 		return true
 	})
 }
+
+// Stats returns the statistics for the circuit breaker associated with the
+// given key. If no breaker exists for the key, it returns a zero-value
+// BreakerStats with StateClosed.
+func (kb *KeyedBreaker[T]) Stats(key string) BreakerStats {
+	if v, ok := kb.breakers.Load(key); ok {
+		return v.(*Breaker[T]).Stats()
+	}
+	return BreakerStats{State: StateClosed}
+}
+
+// DoWithFallback executes fn within the circuit breaker associated with the
+// given key. If the circuit is open, it calls the fallback function instead of
+// returning ErrCircuitOpen.
+func (kb *KeyedBreaker[T]) DoWithFallback(ctx context.Context, key string, fn func(context.Context) (T, error), fallback func(error) (T, error)) (T, error) {
+	return kb.getOrCreate(key).DoWithFallback(ctx, fn, fallback)
+}

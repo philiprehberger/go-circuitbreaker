@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -39,6 +40,15 @@ func (s State) String() string {
 	}
 }
 
+// BreakerStats contains point-in-time statistics for a circuit breaker.
+type BreakerStats struct {
+	Successes           int64
+	Failures            int64
+	Trips               int64
+	ConsecutiveFailures int
+	State               State
+}
+
 // Option is a functional option for configuring a Breaker.
 type Option[T any] func(*config)
 
@@ -48,6 +58,9 @@ type config struct {
 	timeout          time.Duration
 	maxHalfOpen      int
 	onStateChange    func(from, to State)
+	ignoreErrors     func(error) bool
+	onTrip           func()
+	onReset          func()
 }
 
 func defaultConfig() config {
@@ -107,6 +120,33 @@ func WithMaxHalfOpen[T any](n int) Option[T] {
 	}
 }
 
+// WithIgnoreErrors sets a predicate that determines which errors should not
+// count as failures. If pred returns true for an error, that error is treated
+// as a success from the circuit breaker's perspective (the error is still
+// returned to the caller). This is useful for distinguishing business-logic
+// errors from infrastructure errors.
+func WithIgnoreErrors[T any](pred func(error) bool) Option[T] {
+	return func(c *config) {
+		c.ignoreErrors = pred
+	}
+}
+
+// WithOnTrip sets a callback that is invoked when the circuit breaker
+// transitions to the open state (trips).
+func WithOnTrip[T any](fn func()) Option[T] {
+	return func(c *config) {
+		c.onTrip = fn
+	}
+}
+
+// WithOnReset sets a callback that is invoked when the circuit breaker
+// transitions back to the closed state.
+func WithOnReset[T any](fn func()) Option[T] {
+	return func(c *config) {
+		c.onReset = fn
+	}
+}
+
 // Breaker is a generic circuit breaker that wraps calls to external services.
 // It is safe for concurrent use.
 type Breaker[T any] struct {
@@ -117,6 +157,9 @@ type Breaker[T any] struct {
 	successCount    int
 	halfOpenCount   int
 	openedAt        time.Time
+	totalSuccesses  atomic.Int64
+	totalFailures   atomic.Int64
+	totalTrips      atomic.Int64
 }
 
 // New creates a new Breaker with the given options.
@@ -157,6 +200,15 @@ func (b *Breaker[T]) setState(to State) {
 	b.halfOpenCount = 0
 	if to == StateOpen {
 		b.openedAt = time.Now()
+		b.totalTrips.Add(1)
+		if b.cfg.onTrip != nil {
+			b.cfg.onTrip()
+		}
+	}
+	if to == StateClosed && from != StateClosed {
+		if b.cfg.onReset != nil {
+			b.cfg.onReset()
+		}
 	}
 	if b.cfg.onStateChange != nil {
 		b.cfg.onStateChange(from, to)
@@ -204,6 +256,12 @@ func (b *Breaker[T]) executeClosed(fn func() (T, error)) (T, error) {
 	defer b.mu.Unlock()
 
 	if err != nil {
+		if b.cfg.ignoreErrors != nil && b.cfg.ignoreErrors(err) {
+			b.totalSuccesses.Add(1)
+			b.failureCount = 0
+			return result, err
+		}
+		b.totalFailures.Add(1)
 		b.failureCount++
 		if b.failureCount >= b.cfg.threshold {
 			b.setState(StateOpen)
@@ -211,6 +269,7 @@ func (b *Breaker[T]) executeClosed(fn func() (T, error)) (T, error) {
 		return result, err
 	}
 
+	b.totalSuccesses.Add(1)
 	b.failureCount = 0
 	return result, nil
 }
@@ -223,10 +282,20 @@ func (b *Breaker[T]) executeHalfOpen(fn func() (T, error)) (T, error) {
 	defer b.mu.Unlock()
 
 	if err != nil {
+		if b.cfg.ignoreErrors != nil && b.cfg.ignoreErrors(err) {
+			b.totalSuccesses.Add(1)
+			b.successCount++
+			if b.successCount >= b.cfg.successThreshold {
+				b.setState(StateClosed)
+			}
+			return result, err
+		}
+		b.totalFailures.Add(1)
 		b.setState(StateOpen)
 		return result, err
 	}
 
+	b.totalSuccesses.Add(1)
 	b.successCount++
 	if b.successCount >= b.cfg.successThreshold {
 		b.setState(StateClosed)
@@ -240,4 +309,55 @@ func (b *Breaker[T]) Reset() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.setState(StateClosed)
+}
+
+// Stats returns a point-in-time snapshot of the circuit breaker's statistics.
+func (b *Breaker[T]) Stats() BreakerStats {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return BreakerStats{
+		Successes:           b.totalSuccesses.Load(),
+		Failures:            b.totalFailures.Load(),
+		Trips:               b.totalTrips.Load(),
+		ConsecutiveFailures: b.failureCount,
+		State:               b.currentState(),
+	}
+}
+
+// DoWithFallback executes fn within the circuit breaker. If the circuit is open,
+// it calls the fallback function instead of returning ErrCircuitOpen. The
+// fallback receives ErrCircuitOpen as its argument.
+func (b *Breaker[T]) DoWithFallback(ctx context.Context, fn func(context.Context) (T, error), fallback func(error) (T, error)) (T, error) {
+	var zero T
+
+	if err := ctx.Err(); err != nil {
+		return zero, err
+	}
+
+	b.mu.Lock()
+	state := b.currentState()
+
+	switch state {
+	case StateClosed:
+		b.mu.Unlock()
+		return b.executeClosed(func() (T, error) {
+			return fn(ctx)
+		})
+	case StateOpen:
+		b.mu.Unlock()
+		return fallback(ErrCircuitOpen)
+	case StateHalfOpen:
+		if b.halfOpenCount >= b.cfg.maxHalfOpen {
+			b.mu.Unlock()
+			return fallback(ErrCircuitOpen)
+		}
+		b.halfOpenCount++
+		b.mu.Unlock()
+		return b.executeHalfOpen(func() (T, error) {
+			return fn(ctx)
+		})
+	default:
+		b.mu.Unlock()
+		return fallback(ErrCircuitOpen)
+	}
 }

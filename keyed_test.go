@@ -3,6 +3,7 @@ package circuitbreaker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -94,5 +95,75 @@ func TestKeyedResetAll(t *testing.T) {
 	}
 	if kb.State("b") != StateClosed {
 		t.Fatalf("expected StateClosed for key 'b' after ResetAll, got %v", kb.State("b"))
+	}
+}
+
+func TestKeyedStats(t *testing.T) {
+	kb := NewKeyed[int](WithThreshold[int](5))
+	ctx := context.Background()
+
+	for i := 0; i < 3; i++ {
+		_, _ = kb.Do(ctx, "a", func() (int, error) {
+			return 1, nil
+		})
+	}
+	_, _ = kb.Do(ctx, "a", func() (int, error) {
+		return 0, errFail
+	})
+
+	s := kb.Stats("a")
+	if s.Successes != 3 {
+		t.Fatalf("expected 3 successes for key 'a', got %d", s.Successes)
+	}
+	if s.Failures != 1 {
+		t.Fatalf("expected 1 failure for key 'a', got %d", s.Failures)
+	}
+
+	// Unknown key should return zero stats
+	s2 := kb.Stats("unknown")
+	if s2.Successes != 0 || s2.Failures != 0 || s2.State != StateClosed {
+		t.Fatalf("expected zero stats for unknown key, got %+v", s2)
+	}
+}
+
+func TestKeyedDoWithFallback(t *testing.T) {
+	kb := NewKeyed[string](WithThreshold[string](1), WithTimeout[string](time.Hour))
+	ctx := context.Background()
+
+	// Open key "a"
+	_, _ = kb.Do(ctx, "a", func() (string, error) {
+		return "", errFail
+	})
+
+	// Fallback should fire for open key
+	result, err := kb.DoWithFallback(ctx, "a",
+		func(ctx context.Context) (string, error) {
+			return "primary", nil
+		},
+		func(err error) (string, error) {
+			return fmt.Sprintf("fallback: %v", err), nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != "fallback: circuit breaker is open" {
+		t.Fatalf("expected fallback result, got %q", result)
+	}
+
+	// Key "b" should use primary
+	result, err = kb.DoWithFallback(ctx, "b",
+		func(ctx context.Context) (string, error) {
+			return "primary-b", nil
+		},
+		func(err error) (string, error) {
+			return "fallback-b", nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != "primary-b" {
+		t.Fatalf("expected 'primary-b', got %q", result)
 	}
 }

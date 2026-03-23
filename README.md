@@ -39,6 +39,46 @@ if errors.Is(err, cb.ErrCircuitOpen) {
 }
 ```
 
+### Fallback
+
+Use `DoWithFallback` to provide a fallback when the circuit is open instead of receiving `ErrCircuitOpen`.
+
+```go
+result, err := b.DoWithFallback(ctx,
+    func(ctx context.Context) (string, error) {
+        return callExternalAPI(ctx)
+    },
+    func(err error) (string, error) {
+        return cachedResponse, nil // serve stale data
+    },
+)
+```
+
+### Stats
+
+Monitor circuit breaker activity with `Stats()`.
+
+```go
+s := b.Stats()
+fmt.Printf("successes=%d failures=%d trips=%d state=%s\n",
+    s.Successes, s.Failures, s.Trips, s.State)
+```
+
+### Error Classification
+
+Use `WithIgnoreErrors` to prevent certain errors (e.g., business-logic errors) from counting as failures.
+
+```go
+b := cb.New[*http.Response](
+    cb.WithThreshold[*http.Response](5),
+    cb.WithIgnoreErrors[*http.Response](func(err error) bool {
+        // 4xx errors are client errors, not infrastructure failures
+        var httpErr *HTTPError
+        return errors.As(err, &httpErr) && httpErr.StatusCode < 500
+    }),
+)
+```
+
 ### Per-Key Circuit Breakers
 
 Use `KeyedBreaker` when you need independent circuit breakers per endpoint, service, or tenant.
@@ -75,12 +115,17 @@ The circuit breaker has three states:
 | `Breaker[T]` | Generic circuit breaker |
 | `New[T](...Option[T])` | Create a new breaker |
 | `Breaker.Do(ctx, fn)` | Execute a function through the breaker |
+| `Breaker.DoWithFallback(ctx, fn, fallback)` | Execute with fallback when open |
 | `Breaker.State()` | Get the current state |
+| `Breaker.Stats()` | Get statistics snapshot |
 | `Breaker.Reset()` | Force the breaker to closed state |
+| `BreakerStats` | Statistics: Successes, Failures, Trips, ConsecutiveFailures, State |
 | `KeyedBreaker[T]` | Per-key circuit breakers |
 | `NewKeyed[T](...Option[T])` | Create a new keyed breaker |
 | `KeyedBreaker.Do(ctx, key, fn)` | Execute with a per-key breaker |
+| `KeyedBreaker.DoWithFallback(ctx, key, fn, fallback)` | Execute with per-key fallback |
 | `KeyedBreaker.State(key)` | Get state for a key |
+| `KeyedBreaker.Stats(key)` | Get statistics for a key |
 | `KeyedBreaker.Reset(key)` | Reset a specific key |
 | `KeyedBreaker.ResetAll()` | Reset all keys |
 | `WithThreshold[T](n)` | Failures before opening (default 5) |
@@ -88,6 +133,9 @@ The circuit breaker has three states:
 | `WithTimeout[T](d)` | Duration in open before half-open (default 30s) |
 | `WithMaxHalfOpen[T](n)` | Max concurrent half-open calls (default 1) |
 | `WithOnStateChange[T](fn)` | State transition callback |
+| `WithIgnoreErrors[T](pred)` | Errors matching predicate don't count as failures |
+| `WithOnTrip[T](fn)` | Callback when circuit opens |
+| `WithOnReset[T](fn)` | Callback when circuit closes |
 | `ErrCircuitOpen` | Error returned when the breaker is open |
 
 ## Development
